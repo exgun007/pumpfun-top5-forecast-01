@@ -16,7 +16,8 @@
 // So the forecast is a seeded Monte Carlo over where each coin can be at each read: drift in log10 market cap,
 // continued rank velocity, and newcomers drawn from the caps that have just been crossing the top of the chart.
 // Seeded end to end, so two runs are byte-identical (the check `run_deterministic`).
-'use strict';
+//
+// This file is an ES module (package.json says "type": "module"), so it exports rather than assigns module.exports.
 
 const FLOOR = 1e-4;
 const PLACES_DEFAULT = 5;
@@ -236,4 +237,4 @@ function buildForecast(opts) {
   return { probabilities, top5: pointTop.slice(0, places), sizes };
 }
 
-module.exports = { buildForecast, FLOOR, binOf };
+export { buildForecast, FLOOR, binOf };

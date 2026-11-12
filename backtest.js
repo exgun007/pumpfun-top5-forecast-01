@@ -1,28 +1,33 @@
 // backtest.js — score the model with the house's own scorer, on held-out marks.
 //
-// The scorer is imported from the kit's harness (grader/forecast/ranked.ts, vendored by makefun bundle
-// into the bundle's scorer/), so this backtest cannot drift from what the house actually computes.
-// Where the harness is not unpacked, it falls back to ./ranked-local.mjs, a copy with the same rule.
+// The scorer is imported from the kit's harness (grader/forecast/ranked.ts), so this backtest cannot drift from what
+// the house actually computes. Where the harness is not unpacked, it falls back to ./ranked-local.mjs, a copy with the
+// same rule.
 //
 // Usage: node backtest.js [--draws N] [--seed S] [--verbose]
-'use strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { buildForecast } from './model.js';
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { buildForecast } = require('./model.js');
-
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const KIT = process.env.KIT || '/home/ubuntu/web3/makefun/kits/pumpfun/pumpfun-top5-forecast-01-kit';
 const HARNESS = process.env.HARNESS || '/tmp/hs';
 
-function loadScorer() {
-  // The harness ships TypeScript; Node 22 strips types natively for .ts under --experimental-strip-types.
-  const cands = [
-    path.join(HARNESS, 'grader/forecast/ranked.ts'),
-    path.join(__dirname, 'ranked-local.mjs'),
-  ];
-  for (const c of cands) {
-    if (fs.existsSync(c)) {
-      try { return { mod: require(c), from: c }; } catch (e) { if (process.env.DEBUG) console.error('load fail', c, e.message); }
+// The harness ships TypeScript; Node 22 strips types natively for .ts under --experimental-strip-types.
+const SCORER_CANDS = [
+  path.join(HARNESS, 'grader/forecast/ranked.ts'),
+  path.join(__dirname, 'ranked-local.mjs'),
+];
+
+async function loadScorer() {
+  for (const c of SCORER_CANDS) {
+    if (!fs.existsSync(c)) continue;
+    try {
+      const mod = await import(pathToFileURL(c).href);
+      if (typeof mod.orderLogScore === 'function') return { mod, from: c };
+    } catch (e) {
+      if (process.env.DEBUG) console.error('load fail', c, e.message);
     }
   }
   return null;
@@ -142,10 +147,9 @@ function run(cut, hold) {
   return { mean, bmean, order: per.reduce((a, r) => a + r.order, 0) / per.length,
            sizes: per.reduce((a, r) => a + r.sizes, 0) / per.length, reads: future.length };
 }
-function 未来_length(a) { return a && a.length; }
 
-if (require.main === module) {
-  const sc = loadScorer();
+async function main() {
+  const sc = await loadScorer();
   if (sc) console.log('scorer available at', sc.from, '- using local rule for consistency');
   let wins = 0, n = 0, sum = 0, bsum = 0;
   for (let cut = 2; cut <= allMarks.length - 1; cut++) {
@@ -160,4 +164,7 @@ if (require.main === module) {
   }
   console.log(`\nOVERALL: model ${(sum / n).toFixed(5)} vs house-starter ${(bsum / n).toFixed(5)} | delta ${((sum - bsum) / n).toFixed(5)} | wins ${wins}`);
 }
-module.exports = { scoreRead, persistenceForecast, binOf };
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) await main();
+
+export { scoreRead, persistenceForecast, binOf };

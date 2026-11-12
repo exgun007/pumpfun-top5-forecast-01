@@ -7,10 +7,8 @@
 //              name there - the lever that decides this task, since most places are held by coins born after the cut
 //   sd         how far a coin's log10 cap is allowed to drift between the cut and the read
 //   moverBoost how much the recent rank velocity shifts a coin's place
-import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
-const require = createRequire(import.meta.url);
-const { buildForecast } = require('./model.js');
+import { buildForecast } from './model.js';
 
 const KIT = process.env.KIT ?? '/home/ubuntu/web3/makefun/kits/pumpfun/pumpfun-top5-forecast-01-kit';
 const task = JSON.parse(readFileSync(`${KIT}/input/task.json`, 'utf8'));
