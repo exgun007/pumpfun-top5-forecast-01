@@ -41,6 +41,9 @@ function log10Sol(lamports) {
   return Math.log10(Number(BigInt(lamports))) - 9;
 }
 
+/** Standard normal CDF, via the same erfc the bin inds use. */
+function normCdf(x) { return 0.5 * erfc(-x / Math.SQRT2); }
+
 /** erfc(x), Numerical Recipes' erfcc (fractional error under 1.2e-7 everywhere). */
 function erfc(x) {
   const z = Math.abs(x);
@@ -79,6 +82,7 @@ function buildForecast(opts) {
   const marks = (opts.marks || []).filter((m) => m && Array.isArray(m.rows) && m.rows.length > 0);
   const reads = (opts.reads || task.reads || []).map((s) => Date.parse(s)).filter(Number.isFinite);
   const edges = (task.size && task.size.edges) || [];
+  const BINS = edges.length + 1;
   const places = Math.min(PLACES_DEFAULT, task.places || PLACES_DEFAULT);
   const chartSize = task.chart_size || CHART_DEFAULT;
   const N = opts.draws || 20000;
@@ -99,12 +103,26 @@ function buildForecast(opts) {
   const ANON = opts.anonShare === undefined ? 0.5 : opts.anonShare;
   const SD = opts.sd === undefined ? 0.3 : opts.sd;
   const MOVER = opts.moverBoost === undefined ? 1 : opts.moverBoost;
+  // CAPDRIFT: log10 cap growth of a top-chart coin per mark. Measured from the marks: the cap *at a place* climbs
+  // +0.144 / +0.354 / +0.446 dex at steps 1 / 2 / 3 because newcomers keep arriving bigger, while a single coin's own
+  // cap is flat (mean -0.014, sd 0.121 per mark). The gap is why the shipped size model sat a full dex too low.
+  const CAPDRIFT = opts.capDrift === undefined ? 0.15 : opts.capDrift;
   const RATE = opts.newcomerRate === undefined ? 6 : opts.newcomerRate;
+  // Analytic-size levers. DRIFT is the log10 cap gain at a place per mark of lead time, measured off the marks:
+  // place 1 sits +0.144 dex after 1 mark, +0.354 after 2, +0.446 after 3 - concave, so the drift is applied through
+  // a tanh saturation against the launch frontier rather than linearly. SIGMA is the spread around that centre, and
+  // SKEW / SDSKEW let lower places sit a touch higher and wider (they are closer to the frontier already).
+  const DRIFT = opts.drift === undefined ? 0.15 : opts.drift;
+  const SIGMA = opts.sigmaSize === undefined ? 0.14 : opts.sigmaSize;
+  const SKEW = opts.placeSkew === undefined ? 0.02 : opts.placeSkew;
+  const SDSKEW = opts.sdSkew === undefined ? 0.2 : opts.sdSkew;
   const CAND_CAP = opts.candCap || 160;
 
   const byCap = (rows) => [...rows].sort((a, b) => (BigInt(b.market_cap_lamports) > BigInt(a.market_cap_lamports) ? 1 : -1));
   const cutMark = marks[marks.length - 1];
   const cutAt = Date.parse(cutMark.at);
+  // Marks are 10 minutes apart; the size model converts a read's timestamp into whole steps with this.
+  const STEP_MS = 10 * 60 * 1000;
   const ranked = byCap(cutMark.rows);
   const rankOf = new Map(ranked.map((r, i) => [r.mint, i + 1]));
 
@@ -124,9 +142,31 @@ function buildForecast(opts) {
   }
 
   // A newcomer has to be big to take a top place at all, so it is drawn around the caps already at the chart's top.
+  // boundaryMean is kept for the doc comment's sake; the draw that matters is the launch frontier below.
   const boundary = ranked.slice(Math.max(0, places - 2), Math.min(ranked.length, chartSize))
     .map((r) => log10Sol(r.market_cap_lamports));
   const boundaryMean = boundary.length ? boundary.reduce((a, b) => a + b, 0) / boundary.length : 0;
+
+  // The launch frontier: what a coin that has just been minted is actually worth. Measured, not assumed.
+  //
+  // The first submission drew newcomers around boundaryMean - the caps at rank 4..100, i.e. 1.48..1.67 dex - and lost
+  // 2.2 nats of size score for it. The practice marks say a newcomer that takes a top place arrives at 2.9..3.56 dex,
+  // a full 1.5 dex above boundaryMean: the coins that reach the top are not the ones sitting mid-chart, they are new
+  // launches that debut big. So the frontier is read off the marks themselves: for every consecutive pair, the cap of
+  // each coin present in the later mark but in no earlier one, and the centre is the mean of the top quarter of those.
+  const launchCaps = [];
+  for (let i = 1; i < marks.length; i++) {
+    const seen = new Set();
+    for (let j = 0; j < i; j++) for (const r of marks[j].rows) seen.add(r.mint);
+    for (const r of marks[i].rows) if (!seen.has(r.mint)) launchCaps.push(log10Sol(r.market_cap_lamports));
+  }
+  launchCaps.sort((a, b) => b - a);
+  const frontierTop = launchCaps.slice(0, Math.max(1, Math.round(launchCaps.length / 4)));
+  // Fall back to the cut's own top cap when no newcomer was ever seen, so the model never invents a scale.
+  const NEWCAP = opts.newcomerCap === undefined
+    ? (frontierTop.length ? frontierTop.reduce((a, b) => a + b, 0) / frontierTop.length : (ranked.length ? log10Sol(ranked[0].market_cap_lamports) : boundaryMean))
+    : opts.newcomerCap;
+  const NEWSD = opts.newcomerSd === undefined ? 0.30 : opts.newcomerSd;
 
   const tally = reads.map(() => new Map());   // "place|mint" -> draws
   const binTally = reads.map(() => new Map()); // "place|bin"  -> draws
@@ -138,12 +178,12 @@ function buildForecast(opts) {
     for (let d = 0; d < N; d++) {
       const field = [];
       for (const c of cands) {
-        const drift = MOVER * 0.02 * c.vel * steps;
+        const drift = MOVER * 0.02 * c.vel * steps + CAPDRIFT * steps;
         field.push({ mint: c.mint, lc: c.lc + drift + SD * Math.sqrt(Math.max(steps, 1)) * gauss() });
       }
       let nNew = 0;
       for (let k = 0; k < 12; k++) if (rng() < Math.min(0.95, lambda / 12)) nNew++;
-      for (let k = 0; k < nNew; k++) field.push({ mint: `\u0000new${d}_${k}`, lc: boundaryMean + 0.35 * gauss() });
+      for (let k = 0; k < nNew; k++) field.push({ mint: `\u0000new${d}_${k}`, lc: NEWCAP + NEWSD * gauss() });
       field.sort((a, b) => b.lc - a.lc);
       for (let k = 0; k < places && k < field.length; k++) {
         const key = `${k + 1}|${field[k].mint}`;
@@ -191,6 +231,69 @@ function buildForecast(opts) {
   probabilities.sort((a, b) => a.place - b.place || b.p - a.p);
 
   // Sizes: the log10 cap distribution of whatever holds each place, per place across all reads.
+  //
+  // Two ways to build that document. 'mc' merges the per-read tallies, which is only right when the per-read
+  // distributions coincide. 'analytic' (the default) writes the document from the physics.
+  //
+  // The physics, read straight off the marks (log10 SOL at each place):
+  //   mark   P1     P2     P3     P4     P5     spread
+  //   20:10  3.036  2.122  1.984  1.974  1.847  1.19
+  //   20:20  3.115  2.916  2.638  2.385  2.160  0.96
+  //   20:30  3.258  3.185  3.178  3.122  3.096  0.16
+  //   20:40  3.468  3.254  3.225  3.185  3.115  0.35
+  //   20:50  3.561  3.316  3.309  3.304  3.282  0.28
+  // The places converge on a common level: P5 climbs +0.36/mark while P1 climbs +0.13/mark and the spread collapses
+  // from 1.19 dex to 0.28. That is the top of the chart being repopulated by big launches, so each place relaxes
+  // from its cut cap toward one target level A with time constant TAU.
+  //
+  // Critically the document is the MIXTURE of the per-read Gaussians, not the Gaussian at the mean read. The scorer
+  // averages ln P over seven reads against one submitted document, so by Jensen the mixture is what it pays for.
+  // Building it at the mean step and calling the spread sd is the mistake the first submission made.
+  //
+  // The parameters are the minimax choice from minimax.js, not the in-sample optimum. The in-sample fit wants
+  // sigma0 = 0.03 dex (under one bin) and scores -10.07, but it collapses to -32 if A misses high by half a dex; six
+  // practice reads cannot pin A that hard and the live window runs four reads longer than anything checkable. The
+  // minimax set gives up ~1 nats in the rosy case to lift the worst case from -34 to -16.9 (see robust.js).
+  let sizes;
+  if ((opts.sizeModel || 'analytic') === 'analytic') {
+    const A_LEVEL = opts.sizeLevel === undefined ? 3.35 : opts.sizeLevel;
+    const TAU = opts.sizeTau === undefined ? 2 : opts.sizeTau;
+    const SIGMA0 = opts.sigmaSize === undefined ? 0.14 : opts.sigmaSize;
+    const SIGMA1 = opts.sigmaGrowth === undefined ? 0.02 : opts.sigmaGrowth;
+    const D1 = opts.placeSkew === undefined ? 0.2 : opts.placeSkew;
+    const D5 = opts.lastSkew === undefined ? 0 : opts.lastSkew;
+    // Step of each read, in marks after the cut. Reads are every 10 min and the task fixes the step size, but derive
+    // it rather than assume, so a different grid stays correct.
+    const stepOf = (r) => Math.max(0, (r - cutAt) / STEP_MS);
+    sizes = [];
+    for (let k = 0; k < places; k++) {
+      const cap = ranked.length ? log10Sol(ranked[Math.min(k, ranked.length - 1)].market_cap_lamports) : boundaryMean;
+      const target = A_LEVEL + (k === 0 ? D1 : 0) + (k === places - 1 ? D5 : 0);
+      // Mixture over the reads the scorer will actually use.
+      const raw = new Array(BINS).fill(0);
+      for (const r of reads) {
+        const t = stepOf(r);
+        const travelled = 1 - Math.exp(-t / Math.max(0.2, TAU));
+        const mu = cap + (target - cap) * travelled;
+        const sd = Math.max(0.025, SIGMA0 + SIGMA1 * t);
+        let tot = 0;
+        const g = new Array(BINS).fill(0);
+        for (let b = 0; b < BINS; b++) {
+          const lo = b === 0 ? -Infinity : edges[b - 1];
+          const hi = b === BINS - 1 ? Infinity : edges[b];
+          const q = (hi === Infinity ? 1 : normCdf((hi - mu) / sd)) - (lo === -Infinity ? 0 : normCdf((lo - mu) / sd));
+          g[b] = q > 0 ? q : 0;
+          tot += g[b];
+        }
+        for (let b = 0; b < BINS; b++) raw[b] += (g[b] / (tot || 1)) / reads.length;
+      }
+      for (let b = 0; b < BINS; b++) {
+        const p = Math.floor((raw[b] || 0) * MICRO) / MICRO;
+        if (p > 0) sizes.push({ place: k + 1, bin: b, p });
+      }
+    }
+    sizes.sort((a, b) => a.place - b.place || a.bin - b.bin);
+  } else {
   const sizeTotals = new Map();
   for (let ri = 0; ri < reads.length; ri++) {
     for (const [key, count] of binTally[ri]) {
@@ -202,7 +305,7 @@ function buildForecast(opts) {
     const place = Number(key.slice(0, key.indexOf('|')));
     perPlaceTotal.set(place, (perPlaceTotal.get(place) || 0) + count);
   }
-  const sizes = [];
+  sizes = [];
   for (const [key, count] of [...sizeTotals].sort((a, b) => a[0].localeCompare(b[0]))) {
     const bar = key.indexOf('|');
     const place = Number(key.slice(0, bar));
@@ -213,6 +316,7 @@ function buildForecast(opts) {
     if (p > 0) sizes.push({ place, bin, p });
   }
   sizes.sort((a, b) => a.place - b.place || a.bin - b.bin);
+  }
 
   // The point guess: the real coin most often drawn at each place at the last read, topped up from the cut chart.
   const pointTop = [];

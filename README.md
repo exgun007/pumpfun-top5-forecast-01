@@ -41,12 +41,61 @@ A seeded Monte Carlo over where each coin can be at each read (`model.js`):
    often each was drawn there. The other half stays unnamed. Tally is merged across the seven reads, each worth
    `1/reads`, and rounded **down** to 6 decimals so rounding can never push a place's sum over 1.
 6. **Sizes** — the log10 cap distribution of whatever actually holds each place, per place across all reads, into the
-   82 bins the task's 81 edges define.
+   82 bins the task's 81 edges define. This is now written **analytically** rather than merged from the simulation
+   tallies; see "The size document" below.
 7. **top5** — the real coin drawn most often at each place at the last read, topped up from the cut chart. This only
    feeds hits and the agreement tie-break.
 
 Everything is seeded (`mulberry32`, seed 20261112); nothing reads the clock or the network. Two runs are
 byte-identical — verified by running into two output dirs and diffing (`sha256` equal).
+
+## The size document
+
+The first submission scored -35.70 (order -19.56, size -16.14, rank 67/323). The order half was already top-10
+calibre — place 10's order was -19.50 — so the entire gap was the size document, which sat almost two dex too low.
+
+The physics, read straight off the marks (log10 SOL of the cap at each place):
+
+```
+mark   P1     P2     P3     P4     P5     spread
+20:10  3.036  2.122  1.984  1.974  1.847  1.19
+20:20  3.115  2.916  2.638  2.385  2.160  0.96
+20:30  3.258  3.185  3.178  3.122  3.096  0.16
+20:40  3.468  3.254  3.225  3.185  3.115  0.35
+20:50  3.561  3.316  3.309  3.304  3.282  0.28
+```
+
+The places **converge on a common level**. P5 climbs +0.36 dex per mark while P1 climbs only +0.13, and the spread
+collapses from 1.19 dex to 0.28. That is not the incumbents drifting; it is the top of the chart being repopulated by
+big new launches and settling. So each place relaxes from its cut cap toward one target level `A`, with time constant
+`tau`, and the document is the **mixture over the reads** of a Gaussian around that centre whose width grows with the
+horizon.
+
+The mixture matters and is the part the first submission missed. The scorer averages `ln P` over seven reads against
+one submitted document, so the document it pays for is the average of the per-read distributions, not the
+distribution at the mean read. Because the cap travels about half a dex across the window, the mixture is
+meaningfully wider than a Gaussian at the mean step; building the latter and calling its width `sd` is over-confident
+at both ends. Switching from the merged simulation tally to this mixture is worth **+3.3 nats** of size
+(-15.93 -> -12.59) on the practice folds.
+
+Parameters are the **minimax** choice, not the in-sample optimum, because the practice data cannot pin the target
+level and the live window runs four reads past anything checkable:
+
+| candidate | -0.3 dex | 0.0 | +0.3 dex | worst |
+|---|---|---|---|---|
+| point-fit A3.45 s.03 | -34.02 | -11.81 | -16.69 | **-34.02** |
+| minimax A3.35 s.14 (shipped) | -16.74 | -12.78 | -16.85 | **-16.85** |
+
+The in-sample fit wins the middle by a nat and loses the tails by seventeen. Shipping the floor.
+
+Validation, against a harness that reproduces the house scorer to 0.02 nats (local -35.68 v live -35.70):
+
+* `sizefit3.js` — leave-one-fold-out on the three mature cuts, mean size **-13.97** v the submitted -16.14.
+* `robust.js` — sensitivity to each knob, single-fold training, and extrapolation to the 7-read horizon.
+* `minimax.js` — the hostile-scenario grid that picks the shipped parameters.
+* `evalreal.js` — the real `buildForecast` end to end, so the number is the pipeline's, not a re-implementation's.
+* `orderfit.js` — sweeps `anonShare`, `sd` and `moverBoost`; confirms the shipped 0.5 / 0.3 / 1 is already the
+  optimum, so the order half was left alone.
 
 ## The scoring rule it optimises
 
